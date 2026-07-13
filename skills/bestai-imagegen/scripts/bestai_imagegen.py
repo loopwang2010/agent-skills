@@ -46,10 +46,10 @@ DEFAULT_BASE = os.environ.get("BESTAI_BASE_URL", "https://api.bestai.codes/v1")
 DEFAULT_MODEL = "gpt-5.5"  # universally available; gpt-5.6-luna 404s on some accounts
 
 # Hard allowlist: credentials are only ever sent to these domains and their
-# subdomains (e.g. api.bestai.codes). Guards against a mis-set / switched
-# cc-switch base_url leaking the key to an untrusted host. Add your own hosts
-# to this tuple if you route through a different gateway.
-ALLOWED_DOMAINS = ("bestai.codes",)
+# subdomains (e.g. api.bestai.codes, relay01.favcodes.win). Guards against a
+# mis-set / switched cc-switch base_url leaking the key to an untrusted host.
+# Edit this tuple to change what is permitted.
+ALLOWED_DOMAINS = ("cccode.ai", "favcodes.win", "bestai.codes", "unitoks.com")
 
 
 def host_allowed(base_url):
@@ -130,24 +130,33 @@ def _collect_b64(node, keys, out):
             _collect_b64(v, keys, out)
 
 
-def build_payload(prompt, model, size, quality):
+def _image_data_url(path):
+    ext = os.path.splitext(path)[1].lower()
+    mime = {".png": "image/png", ".webp": "image/webp",
+            ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext, "image/png")
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    return f"data:{mime};base64,{b64}"
+
+
+def build_payload(prompt, model, size, quality, image_paths=None):
     tool = {"type": "image_generation"}
     if size:
         tool["size"] = size
     if quality:
         tool["quality"] = quality
+    # content = the edit/generation instruction + any input images to edit from.
+    # Passing input_image(s) turns this into an EDIT (classic /v1/images/edits is
+    # down on bestai; the Responses tool edits via input_image on the same model).
+    content = [{"type": "input_text", "text": prompt}]
+    for p in image_paths or []:
+        content.append({"type": "input_image", "image_url": _image_data_url(p)})
     return {
         "model": model,
         "stream": True,
         # NOTE: input MUST be a list — a bare string yields upstream 400
         # "Input must be a list" on the Codex backend.
-        "input": [
-            {
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": prompt}],
-            }
-        ],
+        "input": [{"type": "message", "role": "user", "content": content}],
         "tools": [tool],
     }
 
@@ -220,15 +229,236 @@ def save_png(b64, out_path):
     return len(raw), dims
 
 
+# ---------------------------------------------------------------------------
+# Gemini via the Antigravity path. Credentials come from the cc-switch provider
+# whose base_url contains "antigravity" (the `anti-bestai` provider:
+# ANTHROPIC_BASE_URL=…/antigravity + ANTHROPIC_AUTH_TOKEN). Uses the Anthropic
+# /v1/messages endpoint (x-api-key auth), NOT /v1beta generateContent — the
+# Antigravity upstream account authenticates by api_key, and generateContent
+# (ForwardGemini) requires OAuth and 401s. Verified end-to-end 2026-07-13.
+# ---------------------------------------------------------------------------
+GEMINI_DEFAULT_MODEL = "gemini-3-pro-image"  # alts: gemini-3.1-flash-image, gemini-2.5-flash-image
+
+
+_ANTIGRAVITY_BASE_FIELDS = ("GOOGLE_GEMINI_BASE_URL", "ANTHROPIC_BASE_URL",
+                            "OPENAI_BASE_URL", "GEMINI_BASE_URL")
+_ANTIGRAVITY_KEY_FIELDS = ("GEMINI_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                           "OPENAI_API_KEY", "GOOGLE_API_KEY", "API_KEY")
+
+
+def _extract_base_key(sc):
+    merged = {**(sc.get("auth") or {}), **(sc.get("env") or {})}
+    base = next((merged[f] for f in _ANTIGRAVITY_BASE_FIELDS if merged.get(f)), "")
+    if not base and isinstance(sc.get("config"), str):
+        m = re.search(r'base_url\s*=\s*"([^"]+)"', sc["config"])
+        if m:
+            base = m.group(1)
+    key = next((merged[f] for f in _ANTIGRAVITY_KEY_FIELDS if merged.get(f)), None)
+    return base, key
+
+
+def resolve_antigravity_from_ccswitch():
+    """Return (base_url, key) from the cc-switch provider whose base_url contains
+    'antigravity'. Prefers the current Gemini provider (e.g. `antigravity-gemini`),
+    then falls back to any matching provider. Never raises."""
+    settings_p = os.path.join(CCSWITCH_DIR, "settings.json")
+    db_p = os.path.join(CCSWITCH_DIR, "cc-switch.db")
+    if not os.path.exists(db_p):
+        return None, None
+    try:
+        con = sqlite3.connect(f"file:{db_p}?mode=ro", uri=True)
+        try:
+            rows = con.execute("SELECT id, settings_config FROM providers").fetchall()
+        finally:
+            con.close()
+        by_id = {}
+        for pid, scj in rows:
+            try:
+                by_id[pid] = json.loads(scj)
+            except Exception:
+                continue
+        order = []
+        try:
+            st = json.load(open(settings_p, encoding="utf-8"))
+            for k in ("currentProviderGemini", "currentProviderClaude"):
+                if st.get(k) in by_id:
+                    order.append(st[k])
+        except Exception:
+            pass
+        order += [p for p in by_id if p not in order]
+        for pid in order:
+            base, key = _extract_base_key(by_id[pid])
+            if base and "antigravity" in base.lower() and key:
+                return base, key
+        return None, None
+    except Exception:
+        return None, None
+
+
+def _collect_gemini_images(node, out):
+    """Walk a Gemini response for inlineData/inline_data base64 image parts."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k in ("inlineData", "inline_data") and isinstance(v, dict) and v.get("data"):
+                out.append(v["data"])
+            else:
+                _collect_gemini_images(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            _collect_gemini_images(v, out)
+
+
+def _mime_of(path):
+    ext = os.path.splitext(path)[1].lower()
+    return {".png": "image/png", ".webp": "image/webp",
+            ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext, "image/png")
+
+
+def _collect_anthropic_images(node, out):
+    """Walk an Anthropic Messages response for base64 image data (source.data),
+    also handling Gemini inlineData passthrough."""
+    if isinstance(node, dict):
+        src = node.get("source")
+        if isinstance(src, dict) and isinstance(src.get("data"), str) and len(src["data"]) > 100:
+            out.append(src["data"])
+        for k, v in node.items():
+            if k in ("inlineData", "inline_data") and isinstance(v, dict) and v.get("data"):
+                out.append(v["data"])
+            elif k != "source":
+                _collect_anthropic_images(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            _collect_anthropic_images(v, out)
+
+
+def gemini_generate(opener, base, key, model, prompt, size, image_paths):
+    """POST Antigravity /v1/messages (Anthropic format, upstream api_key auth).
+    Returns (images:list[str b64], error:obj|None). Raises HTTPError/URLError.
+    Uses the messages path — the Antigravity upstream account authenticates by
+    api_key; the /v1beta generateContent path requires OAuth and 401s."""
+    url = base.rstrip("/") + "/v1/messages"
+    content = [{"type": "text", "text": prompt}]
+    for p in image_paths or []:
+        with open(p, "rb") as f:
+            content.append({"type": "image", "source": {
+                "type": "base64", "media_type": _mime_of(p),
+                "data": base64.b64encode(f.read()).decode()}})
+    body = {"model": model, "max_tokens": 8192,
+            "messages": [{"role": "user", "content": content}]}
+    sz = (size or "").upper()
+    if sz in ("1K", "2K", "4K"):
+        # best-effort: the messages upstream may ignore this and return model default
+        body["generationConfig"] = {"imageConfig": {"imageSize": sz}}
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                 "Content-Type": "application/json", "User-Agent": "curl/8.4.0"})
+    with opener.open(req, timeout=300) as resp:
+        data = json.loads(resp.read())
+    images = []
+    _collect_anthropic_images(data, images)
+    return images, data.get("error")
+
+
+def _indexed_out(out, i, n):
+    """out.png -> out.png (n==1) or out_1.png, out_2.png, ... (n>1)."""
+    if n <= 1:
+        return out
+    root, ext = os.path.splitext(out)
+    return f"{root}_{i + 1}{ext or '.png'}"
+
+
+def _retry_generate(gen_fn, retries, label):
+    """gen_fn() -> (images:list[b64], err) or raises HTTPError/URLError.
+    Returns the best b64 image, or _die on exhaustion."""
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            print(f"[{attempt}/{retries}] {label} ...", file=sys.stderr)
+            images, err = gen_fn()
+            if err:
+                msg = str(err.get("message") or err.get("code") or err.get("status") or err)
+                last_err = msg
+                if _retryable(msg):
+                    print(f"  retryable: {msg}", file=sys.stderr)
+                    time.sleep(1.5)
+                    continue
+                _die("upstream error: " + msg)
+            if not images:
+                last_err = "no image in response"
+                print("  no image; retrying ...", file=sys.stderr)
+                time.sleep(1.0)
+                continue
+            return max(images, key=len)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:300]
+            last_err = f"HTTP {e.code}: {detail}"
+            if _retryable(detail) or e.code >= 500 or e.code == 404:
+                print(f"  {last_err} — retrying ...", file=sys.stderr)
+                time.sleep(1.5)
+                continue
+            _die(last_err)
+        except urllib.error.URLError as e:
+            last_err = "network error: " + str(e.reason)
+            print(f"  {last_err} — retrying ...", file=sys.stderr)
+            time.sleep(2.0)
+            continue
+    _die("exhausted retries. last: " + str(last_err) +
+         "\n(503 'No available accounts' => that provider's bestai account pool is down.)")
+
+
+def run_gemini(args, opener):
+    cc_base, cc_key = (None, None)
+    if not args.no_ccswitch:
+        cc_base, cc_key = resolve_antigravity_from_ccswitch()
+    key = args.key or cc_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("BESTAI_API_KEY")
+    base = args.base_url or cc_base
+    if not base:
+        _die("no antigravity base_url — cc-switch has no provider whose base_url "
+             "contains 'antigravity'; pass --base-url (e.g. https://api.bestai.codes/antigravity)")
+    if not key:
+        _die("no API key for gemini/antigravity — pass --key or set GEMINI_API_KEY / BESTAI_API_KEY")
+    if not host_allowed(base):
+        host = urlparse(base).hostname or "(none)"
+        _die(f"base_url host '{host}' is not in the allowed domains "
+             f"{', '.join(ALLOWED_DOMAINS)}. Refusing to send credentials to an untrusted host.")
+    model = args.model if args.model != DEFAULT_MODEL else GEMINI_DEFAULT_MODEL
+    src = "flag" if args.base_url else ("cc-switch" if cc_base else "default")
+    mode = "editing" if args.image else "generating"
+    note = f" from {len(args.image)} image(s)" if args.image else ""
+    n = max(1, args.n)
+    for i in range(n):
+        label = f"gemini/antigravity {mode}{note} #{i + 1}/{n}: {model} @ {base} (base:{src})"
+        b64 = _retry_generate(
+            lambda: gemini_generate(opener, base, key, model, args.prompt, args.size, args.image),
+            args.retries, label)
+        out_i = _indexed_out(args.out, i, n)
+        nb, dims = save_png(b64, out_i)
+        print(f"OK  saved {out_i}{dims}  ({nb} bytes)")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Generate an image via api.bestai.codes")
-    ap.add_argument("--prompt", "-p", required=True, help="image prompt")
+    ap.add_argument("--prompt", "-p", required=True,
+                    help="generation prompt, or edit instruction when --image is given")
+    ap.add_argument("--image", "-i", action="append", default=None,
+                    help="input image to EDIT/reference (png/jpg/webp); repeat for multiple")
+    ap.add_argument("--provider", default="openai", choices=["openai", "gemini"],
+                    help="openai = Responses image_generation (default); "
+                         "gemini = Gemini generateContent (Antigravity by default, "
+                         "or native via --base-url/--key)")
     ap.add_argument("--out", "-o", default="bestai_image.png", help="output PNG path")
     ap.add_argument("--model", "-m", default=DEFAULT_MODEL,
-                    help=f"model (default {DEFAULT_MODEL}; gpt-5.6-luna may 404 on some accounts)")
+                    help=f"openai: text model driving the tool (default {DEFAULT_MODEL}); "
+                         f"gemini: image model (default {GEMINI_DEFAULT_MODEL}; "
+                         "alts gemini-3.1-flash-image, gemini-2.5-flash-image)")
     ap.add_argument("--size", "-s", default=None,
-                    help="e.g. 1024x1024 / 1536x1024 / auto (default: auto)")
-    ap.add_argument("--quality", "-q", default=None, choices=[None, "low", "medium", "high", "auto"])
+                    help="openai: pixel dims e.g. 1024x1024 / 1536x1024 / 2048x2048 / auto; "
+                         "gemini: 1K / 2K / 4K (best-effort — upstream may return model default)")
+    ap.add_argument("--n", "--count", type=int, default=1,
+                    help="number of images to generate (>1 saves out_1.png, out_2.png, ...)")
+    ap.add_argument("--quality", "-q", default=None, choices=[None, "low", "medium", "high", "auto"],
+                    help="openai only: low|medium|high|auto")
     ap.add_argument("--base-url", default=None, help="override base_url (default: from cc-switch, else built-in)")
     ap.add_argument("--key", default=None, help="override API key (default: from cc-switch / env)")
     ap.add_argument("--ccswitch-app", default="codex", choices=["codex", "claude", "claude-desktop"],
@@ -262,49 +492,27 @@ def main():
              f"{', '.join(ALLOWED_DOMAINS)} (base source: {src}). "
              "Refusing to send credentials to an untrusted host.")
 
-    payload = build_payload(args.prompt, args.model, args.size, args.quality)
+    for p in args.image or []:
+        if not os.path.isfile(p):
+            _die(f"input image not found: {p}")
 
-    last_err = None
-    for attempt in range(1, args.retries + 1):
-        tag = f"[{attempt}/{args.retries}]"
-        try:
-            print(f"{tag} requesting {args.model} @ {base_url} "
-                  f"(base:{src}, key:{key_src}) ...", file=sys.stderr)
-            images, text, err = stream_once(opener, base_url, key, payload, args.verbose)
-            if err:
-                last_err = json.dumps(err, ensure_ascii=False)
-                msg = str(err.get("message") or err.get("code") or err)
-                if _retryable(msg):
-                    print(f"{tag} retryable upstream error: {msg}", file=sys.stderr)
-                    time.sleep(1.5)
-                    continue
-                _die("upstream error: " + msg)
-            if not images:
-                # Model returned text but never called the image tool.
-                snippet = (text or "").strip()[:200]
-                last_err = "no image returned; model text: " + snippet
-                print(f"{tag} no image; retrying ...", file=sys.stderr)
-                time.sleep(1.0)
-                continue
-            biggest = max(images, key=len)
-            n, dims = save_png(biggest, args.out)
-            print(f"OK  saved {args.out}{dims}  ({n} bytes)")
-            return
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", "replace")[:300]
-            last_err = f"HTTP {e.code}: {detail}"
-            if _retryable(detail) or e.code >= 500 or e.code == 404:
-                print(f"{tag} {last_err} — retrying ...", file=sys.stderr)
-                time.sleep(1.5)
-                continue
-            _die(last_err)
-        except urllib.error.URLError as e:
-            last_err = "network error: " + str(e.reason)
-            print(f"{tag} {last_err} — retrying ...", file=sys.stderr)
-            time.sleep(2.0)
-            continue
+    if args.provider == "gemini":
+        run_gemini(args, opener)
+        return
 
-    _die("exhausted retries. last: " + str(last_err))
+    mode = "editing" if args.image else "generating"
+    note = f" from {len(args.image)} image(s)" if args.image else ""
+    payload = build_payload(args.prompt, args.model, args.size, args.quality, args.image)
+    n = max(1, args.n)
+    for i in range(n):
+        label = f"{mode}{note} #{i + 1}/{n}: {args.model} @ {base_url} (base:{src}, key:{key_src})"
+        # stream_once returns (images, text, err); [::2] -> (images, err)
+        b64 = _retry_generate(
+            lambda: stream_once(opener, base_url, key, payload, args.verbose)[::2],
+            args.retries, label)
+        out_i = _indexed_out(args.out, i, n)
+        nb, dims = save_png(b64, out_i)
+        print(f"OK  saved {out_i}{dims}  ({nb} bytes)")
 
 
 def _retryable(msg):

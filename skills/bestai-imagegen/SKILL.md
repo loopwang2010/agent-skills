@@ -50,6 +50,8 @@ This skill bundles NO key — everyone uses their own. Never paste a key into ch
 Run the bundled script with your shell/exec/Bash tool (path is relative to this
 skill's own directory):
 
+Generate (text → image):
+
 ```bash
 python "<this-skill-dir>/scripts/bestai_imagegen.py" \
   --prompt "<detailed prompt>" \
@@ -57,17 +59,76 @@ python "<this-skill-dir>/scripts/bestai_imagegen.py" \
   --size 1536x1024 --quality high
 ```
 
+Edit an existing image (pass `--image`; prompt = edit instruction; repeat
+`--image` for multiple inputs / compositing):
+
+```bash
+python "<this-skill-dir>/scripts/bestai_imagegen.py" \
+  --prompt "change only the sky to a dramatic sunset; keep everything else the same" \
+  --image "path/to/source.png" --out "output/imagegen/edited.png"
+```
+
 In Codex the skill dir is `%USERPROFILE%\.codex\skills\bestai-imagegen`; in Claude
 Code it is `$HOME/.claude/skills/bestai-imagegen`. If `python` is missing, try
 `py` or `python3`.
 
-Options: `--prompt/-p` (required), `--out/-o`, `--model/-m` (default `gpt-5.5`),
-`--size/-s`, `--quality/-q` (low|medium|high|auto), `--ccswitch-app`,
-`--no-ccswitch`, `--proxy`, `--retries`, `-v`.
+Options: `--prompt/-p` (required), `--image/-i` (input to edit; repeatable),
+`--out/-o`, `--model/-m` (default `gpt-5.5`), `--size/-s`, `--quality/-q`
+(low|medium|high|auto), `--ccswitch-app`, `--no-ccswitch`, `--proxy`,
+`--retries`, `-v`.
+
+Note: bestai's classic `/v1/images/generations` and `/v1/images/edits` are
+currently down (upstream 502); both generation and editing run through the
+Responses `image_generation` tool (same OpenAI image model underneath).
 
 After it prints `OK  saved <path>`, display the PNG (view_image in Codex / Read in
 Claude Code) and report the saved path. On failure it prints a clear error and
 exits non-zero — relay it.
+
+## Gemini via Antigravity (`--provider gemini`)
+
+Also drives Google Gemini image models through the **Antigravity** path.
+Credentials come from the cc-switch provider whose base_url contains "antigravity".
+Uses the Anthropic `/v1/messages` endpoint; generation and editing (`--image`)
+both work. Default model `gemini-3-pro-image`.
+
+```bash
+python "<script>" --provider gemini --prompt "..." --model gemini-3-pro-image --size 2K --out out.png
+# edit: add --image source.png   (alts: gemini-3.1-flash-image, gemini-2.5-flash-image)
+```
+
+Native (non-Antigravity) Gemini: same flag with an explicit gemini-group key +
+base: `--provider gemini --base-url https://<host> --key sk-<gemini-key> --model gemini-2.5-flash-image`.
+
+STATUS: ✅ verified working (generation + editing) via the Antigravity
+`/v1/messages` path (x-api-key auth). Requires the provider to have a working
+Antigravity account. `--size` is not applied on this path.
+
+## Examples: count / size / model
+
+`<script>` = the bundled `scripts/bestai_imagegen.py`.
+
+```bash
+# OpenAI (default provider)
+python <script> -p "..." -o out.png                       # 1 image
+python <script> -p "..." --size 1536x1024 -q high         # size = pixel dims
+python <script> -p "..." --n 4 -o hero.png                # 4 images -> hero_1..hero_4.png
+python <script> -p "snow mountain background, keep subject" -i src.png -o edit.png
+
+# Gemini (Antigravity)
+python <script> --provider gemini -p "..." -o g.png
+python <script> --provider gemini -p "..." --size 2K      # size = 1K/2K/4K (best-effort)
+python <script> --provider gemini -p "..." -m gemini-3.1-flash-image
+python <script> --provider gemini -p "..." --n 3 -o set.png
+python <script> --provider gemini -p "edit instruction" -i src.png -o g_edit.png
+```
+
+- `--n / --count N` — number of images; N>1 saves `out_1.png, out_2.png, ...`
+- `--size / -s` — openai: pixel dims (`1024x1024` / `1536x1024` / `2048x2048` / `auto`);
+  gemini: `1K` / `2K` / `4K` (best-effort — upstream may return the model default)
+- `--model / -m` — openai: text model (default `gpt-5.5`); gemini: image model
+  (default `gemini-3-pro-image`; alts `gemini-3.1-flash-image`, `gemini-2.5-flash-image`)
+- `--quality / -q` — openai only: `low` / `medium` / `high` / `auto`
 
 ## Prompt guidance
 Structure the prompt as: scene/backdrop → subject → details → constraints. Quote
@@ -82,6 +143,7 @@ unchanged"). Augment only when the user's prompt is generic.
   UA) and connects direct, ignoring stale `HTTP_PROXY` env. Use `--proxy` if you
   actually need one.
 - `input` is sent as a message list (a bare string yields upstream 400).
-- **Domain allowlist (safety)**: the script only sends credentials to `bestai.codes`
-  and its subdomains; a base_url on any other host is rejected before the request.
-  Add your own gateway host to `ALLOWED_DOMAINS` at the top of the script if needed.
+- **Domain allowlist (safety)**: the script only sends credentials to `cccode.ai`,
+  `favcodes.win`, `bestai.codes`, `unitoks.com` and their subdomains; a base_url on
+  any other host is rejected before the request. Edit `ALLOWED_DOMAINS` at the top
+  of the script to change this.

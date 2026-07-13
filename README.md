@@ -5,7 +5,7 @@ directory under `skills/`.
 
 | Skill | What it does |
 |-------|--------------|
-| [`bestai-imagegen`](skills/bestai-imagegen/) | Generate/edit raster images through `api.bestai.codes` by calling the OpenAI Responses `image_generation` tool directly — the path that works even when a client (e.g. Codex on a custom API-key provider) refuses to emit the built-in image tool. Stdlib-only Python, no `pip install`. |
+| [`bestai-imagegen`](skills/bestai-imagegen/) | Generate/edit raster images through `api.bestai.codes`. Two providers: **OpenAI** via the Responses `image_generation` tool (the path that works even when a client like Codex on a custom API-key provider refuses to emit the built-in image tool), and **Gemini** via the Antigravity `/v1/messages` path. Supports batch count, size/quality, model selection, and image editing. Stdlib-only Python, no `pip install`. |
 
 ## Install into Codex
 
@@ -49,16 +49,39 @@ setx BESTAI_API_KEY "sk-..."        # Windows
 
 Never paste an API key into a chat or commit one to a repo. As a safety net the
 script refuses to send credentials to any host outside its `ALLOWED_DOMAINS`
-allowlist (`bestai.codes` by default — add your own gateway host if you route
-through a different one).
+allowlist (edit the tuple at the top of
+`skills/bestai-imagegen/scripts/bestai_imagegen.py` to match your own gateway
+host(s) — the key can never leak to a host you didn't list).
 
-## Quick check
+## Providers & options
 
 ```bash
+# OpenAI (default provider) — text -> image
 python skills/bestai-imagegen/scripts/bestai_imagegen.py \
   -p "a quiet morning campus, two students walking" \
   -o output/test.png -s 1536x1024 -q high
+
+# batch: N>1 saves out_1.png, out_2.png, ...
+python skills/bestai-imagegen/scripts/bestai_imagegen.py -p "..." --n 4 -o hero.png
+
+# edit an existing image (prompt = edit instruction; --image repeatable)
+python skills/bestai-imagegen/scripts/bestai_imagegen.py \
+  -p "change only the sky to a dramatic sunset; keep everything else" \
+  -i source.png -o edited.png
+
+# Gemini via Antigravity
+python skills/bestai-imagegen/scripts/bestai_imagegen.py \
+  --provider gemini -p "..." -m gemini-3-pro-image --size 2K -o g.png
 ```
 
-See each skill's own `SKILL.md` for full usage and notes. Licensed under
-[MIT](LICENSE).
+| Flag | Meaning |
+|------|---------|
+| `--provider` | `openai` (default) or `gemini` (Antigravity `/v1/messages`) |
+| `--n / --count N` | number of images; `N>1` writes `out_1.png, out_2.png, …` |
+| `--size / -s` | openai: pixel dims (`1024x1024` / `1536x1024` / `2048x2048` / `auto`); gemini: `1K` / `2K` / `4K` (best-effort) |
+| `--model / -m` | openai text model (default `gpt-5.5`); gemini image model (default `gemini-3-pro-image`) |
+| `--quality / -q` | openai only: `low` / `medium` / `high` / `auto` |
+| `--image / -i` | source image to edit; repeat for compositing/references |
+
+See the skill's own [`SKILL.md`](skills/bestai-imagegen/SKILL.md) for full usage
+and notes. Licensed under [MIT](LICENSE).
