@@ -1,0 +1,35 @@
+name: skills-smoke
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile all skill scripts (py_compile)
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find skills -name '*.py')
+          if [ ${#files[@]} -eq 0 ]; then echo "no skill scripts found"; exit 1; fi
+          printf '%s\n' "${files[@]}"
+          python -m py_compile "${files[@]}"
+
+      - name: Every skill has a valid SKILL.md (name + description)
+        run: |
+          set -euo pipefail
+          for d in skills/*/; do
+            f="${d}SKILL.md"
+            test -f "$f" || { echo "::error::missing $f"; exit 1; }
+            grep -q '^name:' "$f"        || { echo "::error::$f missing name:"; exit 1; }
+            grep -q '^description:' "$f" || { echo "::error::$f missing description:"; exit 1; }
+            echo "ok: $f"
+          done
