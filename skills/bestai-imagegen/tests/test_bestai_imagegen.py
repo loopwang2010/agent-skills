@@ -392,6 +392,30 @@ class SavePngGuardTests(unittest.TestCase):
                 big.save_png(_b64(b"data"), bad_out)
 
 
+class RetryableClassifyTests(unittest.TestCase):
+    """Transient upstream signals must be classified retryable so a batch run
+    survives a momentary account-concurrency / rate-limit hiccup."""
+
+    def test_transient_signals_are_retryable(self):
+        for msg in (
+            "Concurrency limit exceeded for account, please retry later",
+            "429 Too Many Requests",
+            "rate limit reached",
+            "upstream timeout",
+            "Model not found",
+            "No available accounts",
+        ):
+            self.assertTrue(big._retryable(msg), msg)
+
+    def test_hard_errors_are_not_retryable(self):
+        for msg in (
+            "invalid api key",
+            "content policy violation",
+            "Input must be a list",
+        ):
+            self.assertFalse(big._retryable(msg), msg)
+
+
 class IndexedOutTests(unittest.TestCase):
     def test_single_unchanged(self):
         self.assertEqual(big._indexed_out("a/b.png", 0, 1), "a/b.png")

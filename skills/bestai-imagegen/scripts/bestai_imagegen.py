@@ -614,8 +614,13 @@ def main():
 
 def _retryable(msg):
     m = (msg or "").lower()
+    # Transient upstream conditions worth re-rolling the account / waiting on.
+    # "concurrency limit"/"retry later"/"rate limit" are load-shedding signals
+    # the gateway itself asks us to retry (observed live 2026-07-13).
     return any(s in m for s in ("model not found", "not found", "no available",
-                                "upstream", "timeout", "temporarily"))
+                                "upstream", "timeout", "temporarily",
+                                "concurrency", "retry later", "rate limit",
+                                "too many requests"))
 
 
 if __name__ == "__main__":
