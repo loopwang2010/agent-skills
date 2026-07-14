@@ -23,6 +23,15 @@ jobs:
           printf '%s\n' "${files[@]}"
           python -m py_compile "${files[@]}"
 
+      - name: Run skill test suites (stdlib unittest)
+        run: |
+          set -euo pipefail
+          for d in skills/*/tests; do
+            [ -d "$d" ] || continue
+            echo "== $d =="
+            python -m unittest discover -s "$d" -v
+          done
+
       - name: Every skill has a valid SKILL.md (name + description)
         run: |
           set -euo pipefail
