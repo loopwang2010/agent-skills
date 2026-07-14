@@ -83,53 +83,205 @@ CCSWITCH_CURRENT_KEY = {
     "codex": "currentProviderCodex",
     "claude": "currentProviderClaude",
     "claude-desktop": "currentProviderClaudeDesktop",
+    "gemini": "currentProviderGemini",
 }
 
 
-def resolve_from_ccswitch(app_type="codex"):
-    """Read (base_url, key) from cc-switch's current provider. Returns (None, None)
-    if cc-switch is not present or nothing usable is found. Never raises."""
-    settings_p = os.path.join(CCSWITCH_DIR, "settings.json")
+def _ccswitch_rows(trace):
+    """Load ALL cc-switch providers as rows: {app, id, name, sc, is_current}.
+
+    Handles every storage generation cc-switch has shipped:
+      * new:    ~/.cc-switch/cc-switch.db  (SQLite, providers table,
+                PRIMARY KEY (id, app_type), is_current column)
+      * older:  same db without the is_current column
+      * legacy: ~/.cc-switch/config.json   (v2 per-app sections / v1 flat)
+    Appends a human-readable reason to `trace` for every dead end, so the
+    caller can tell the user WHY resolution failed instead of a silent miss.
+    Never raises; returns [] when nothing is readable.
+    """
+    if not os.path.isdir(CCSWITCH_DIR):
+        trace.append("~/.cc-switch 目录不存在(这台机器没装/没配 cc-switch?)")
+        return []
     db_p = os.path.join(CCSWITCH_DIR, "cc-switch.db")
-    if not (os.path.exists(settings_p) and os.path.exists(db_p)):
-        return None, None
-    try:
-        with open(settings_p, encoding="utf-8") as f:
-            settings = json.load(f)
-        pid = settings.get(CCSWITCH_CURRENT_KEY.get(app_type, "currentProviderCodex"))
-        if not pid:
-            return None, None
-        con = sqlite3.connect(f"file:{db_p}?mode=ro", uri=True)
+    if os.path.exists(db_p):
         try:
-            row = con.execute(
-                "SELECT settings_config FROM providers WHERE id=?", (pid,)
-            ).fetchone()
-        finally:
-            con.close()
-        if not row:
-            return None, None
-        sc = json.loads(row[0])
-        auth = sc.get("auth") or {}
-        env = sc.get("env") or {}
-        key = None
-        for k in ("OPENAI_API_KEY", "API_KEY", "key", "ANTHROPIC_AUTH_TOKEN"):
-            if auth.get(k):
-                key = auth[k]
-                break
-        if not key:
-            for k in ("OPENAI_API_KEY", "API_KEY", "ANTHROPIC_AUTH_TOKEN"):
-                if env.get(k):
-                    key = env[k]
-                    break
-        base = env.get("OPENAI_BASE_URL") or env.get("ANTHROPIC_BASE_URL")
-        cfg = sc.get("config")
-        if not base and isinstance(cfg, str):
-            m = re.search(r'base_url\s*=\s*"([^"]+)"', cfg)
-            if m:
-                base = m.group(1)
-        return base, key
+            con = sqlite3.connect(f"file:{db_p}?mode=ro", uri=True)
+            try:
+                try:
+                    raw = con.execute(
+                        "SELECT app_type, id, name, settings_config, is_current"
+                        " FROM providers").fetchall()
+                except sqlite3.OperationalError:  # old schema: no is_current
+                    raw = [r + (0,) for r in con.execute(
+                        "SELECT app_type, id, name, settings_config"
+                        " FROM providers").fetchall()]
+            finally:
+                con.close()
+            rows = []
+            for app, pid, name, scj, cur in raw:
+                try:
+                    sc = json.loads(scj)
+                except Exception:
+                    continue
+                if isinstance(sc, dict):
+                    rows.append({"app": app, "id": pid, "name": name or pid,
+                                 "sc": sc, "is_current": bool(cur)})
+            if rows:
+                return rows
+            trace.append("cc-switch.db 里没有可读的 provider")
+        except Exception as e:
+            trace.append(f"cc-switch.db 读取失败({e.__class__.__name__})")
+    else:
+        trace.append("cc-switch.db 不存在")
+    return _ccswitch_rows_legacy(trace)
+
+
+def _ccswitch_rows_legacy(trace):
+    """Legacy ~/.cc-switch/config.json (pre-SQLite cc-switch).
+    v2: {"claude": {"providers": {id: {...,"settingsConfig": {...}}}, "current": id},
+         "codex": {...}}   (possibly wrapped in an "apps" object)
+    v1: {"providers": {...}, "current": id}   (claude only)"""
+    cfg_p = os.path.join(CCSWITCH_DIR, "config.json")
+    if not os.path.exists(cfg_p):
+        trace.append("config.json(旧版布局)也不存在")
+        return []
+    try:
+        with open(cfg_p, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception as e:
+        trace.append(f"config.json 解析失败({e.__class__.__name__})")
+        return []
+    if not isinstance(cfg, dict):
+        trace.append("config.json 不是 JSON 对象")
+        return []
+    root = cfg.get("apps") if isinstance(cfg.get("apps"), dict) else cfg
+    sections = {}
+    for app in ("claude", "codex", "claude-desktop", "gemini"):
+        sec = root.get(app)
+        if isinstance(sec, dict) and isinstance(sec.get("providers"), dict):
+            sections[app] = sec
+    if not sections and isinstance(cfg.get("providers"), dict):
+        sections["claude"] = cfg  # v1 flat layout predates multi-app
+    rows = []
+    for app, sec in sections.items():
+        cur = sec.get("current")
+        for pid, p in sec["providers"].items():
+            if not isinstance(p, dict):
+                continue
+            sc = p.get("settingsConfig") or p.get("settings_config")
+            if isinstance(sc, dict):
+                rows.append({"app": app, "id": pid, "name": p.get("name") or pid,
+                             "sc": sc, "is_current": pid == cur})
+    if not rows:
+        trace.append("config.json 里没有可读的 provider")
+    return rows
+
+
+def _ccswitch_current_of(rows, app):
+    """The current provider row of one app: settings.json pointer first
+    (matched WITH app_type — ids repeat across apps), then the row-level
+    is_current flag (the DB-native marker; settings.json may lack the key)."""
+    pid = None
+    try:
+        with open(os.path.join(CCSWITCH_DIR, "settings.json"), encoding="utf-8") as f:
+            pid = json.load(f).get(CCSWITCH_CURRENT_KEY.get(app, ""))
     except Exception:
-        return None, None
+        pass
+    if pid:
+        for r in rows:
+            if r["app"] == app and r["id"] == pid:
+                return r
+    for r in rows:
+        if r["app"] == app and r["is_current"]:
+            return r
+    return None
+
+
+def _openai_base_key_from_sc(sc):
+    """(base, key, base_is_anthropic) for the /v1/responses path.
+    base_is_anthropic marks a base taken from ANTHROPIC_BASE_URL — those are
+    endpoint roots (https://api.bestai.codes) and need /v1 appended."""
+    auth = sc.get("auth") or {}
+    env = sc.get("env") or {}
+    key = None
+    for k in ("OPENAI_API_KEY", "API_KEY", "key", "ANTHROPIC_AUTH_TOKEN"):
+        if auth.get(k):
+            key = auth[k]
+            break
+    if not key:
+        for k in ("OPENAI_API_KEY", "API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+            if env.get(k):
+                key = env[k]
+                break
+    base = env.get("OPENAI_BASE_URL")
+    base_is_anthropic = False
+    if not base and env.get("ANTHROPIC_BASE_URL"):
+        base = env["ANTHROPIC_BASE_URL"]
+        base_is_anthropic = True
+    cfg = sc.get("config")
+    if not base and isinstance(cfg, str):
+        m = re.search(r'base_url\s*=\s*"([^"]+)"', cfg)
+        if m:
+            base = m.group(1)
+    return base, key, base_is_anthropic
+
+
+def _ensure_v1_path(base):
+    b = (base or "").rstrip("/")
+    return b if (not b or b.endswith("/v1")) else b + "/v1"
+
+
+def resolve_from_ccswitch(app_type="codex", trace=None):
+    """Resolve (base_url, key, label) for the OpenAI path from cc-switch.
+
+    1. Current provider of the requested app (lenient, original semantics:
+       a key alone is fine — base falls back to the default later).
+    2. Otherwise BORROW from other providers — current providers of the other
+       apps first, then everything — but strictly: the candidate must have a
+       key AND an https base on an allowlisted host (borrowed credentials
+       never leave the allowlist), and antigravity bases are skipped (that is
+       a different protocol path; use --provider gemini for it).
+
+    Returns (None, None, None) when nothing usable; `trace` (optional list)
+    collects the reasons so the final error can say why.
+    """
+    trace = trace if trace is not None else []
+    rows = _ccswitch_rows(trace)
+    if not rows:
+        return None, None, None
+
+    prim = _ccswitch_current_of(rows, app_type)
+    if prim is not None:
+        base, key, is_anth = _openai_base_key_from_sc(prim["sc"])
+        if is_anth:
+            base = _ensure_v1_path(base)
+        if key or base:
+            return base, key, f"cc-switch:{app_type}/{prim['name']}"
+        trace.append(f"当前 {app_type} provider '{prim['name']}' 里没有 key/base_url")
+    else:
+        trace.append(f"没有当前 {app_type} provider(settings.json 指针和 is_current 都没有)")
+
+    seen = {id(prim)} if prim is not None else set()
+    ordered = []
+    for app in ("codex", "claude", "claude-desktop"):
+        r = _ccswitch_current_of(rows, app)
+        if r is not None and id(r) not in seen:
+            ordered.append(r)
+            seen.add(id(r))
+    ordered += [r for r in rows if id(r) not in seen]
+    for r in ordered:
+        base, key, is_anth = _openai_base_key_from_sc(r["sc"])
+        if not (base and key):
+            continue
+        if "antigravity" in base.lower():
+            continue  # anthropic-protocol path; wrong for /v1/responses
+        if is_anth:
+            base = _ensure_v1_path(base)
+        if not host_allowed(base):
+            continue  # never borrow creds bound for a non-allowlisted host
+        return base, key, f"cc-switch:{r['app']}/{r['name']}"
+    trace.append("没有任何 provider 同时有 key + 白名单内的 https base_url")
+    return None, None, None
 
 
 def _die(msg, code=1):
@@ -337,42 +489,28 @@ def _extract_base_key(sc):
     return base, key
 
 
-def resolve_antigravity_from_ccswitch():
+def resolve_antigravity_from_ccswitch(trace=None):
     """Return (base_url, key) from the cc-switch provider whose base_url contains
-    'antigravity'. Prefers the current Gemini provider (e.g. `antigravity-gemini`),
-    then falls back to any matching provider. Never raises."""
-    settings_p = os.path.join(CCSWITCH_DIR, "settings.json")
-    db_p = os.path.join(CCSWITCH_DIR, "cc-switch.db")
-    if not os.path.exists(db_p):
+    'antigravity'. Prefers the current Gemini/Claude provider, then any matching
+    provider. Same storage handling as resolve_from_ccswitch (new SQLite layout,
+    old schema, legacy config.json). Never raises."""
+    trace = trace if trace is not None else []
+    rows = _ccswitch_rows(trace)
+    if not rows:
         return None, None
-    try:
-        con = sqlite3.connect(f"file:{db_p}?mode=ro", uri=True)
-        try:
-            rows = con.execute("SELECT id, settings_config FROM providers").fetchall()
-        finally:
-            con.close()
-        by_id = {}
-        for pid, scj in rows:
-            try:
-                by_id[pid] = json.loads(scj)
-            except Exception:
-                continue
-        order = []
-        try:
-            st = json.load(open(settings_p, encoding="utf-8"))
-            for k in ("currentProviderGemini", "currentProviderClaude"):
-                if st.get(k) in by_id:
-                    order.append(st[k])
-        except Exception:
-            pass
-        order += [p for p in by_id if p not in order]
-        for pid in order:
-            base, key = _extract_base_key(by_id[pid])
-            if base and "antigravity" in base.lower() and key:
-                return base, key
-        return None, None
-    except Exception:
-        return None, None
+    ordered, seen = [], set()
+    for app in ("gemini", "claude"):
+        r = _ccswitch_current_of(rows, app)
+        if r is not None and id(r) not in seen:
+            ordered.append(r)
+            seen.add(id(r))
+    ordered += [r for r in rows if id(r) not in seen]
+    for r in ordered:
+        base, key = _extract_base_key(r["sc"])
+        if base and "antigravity" in base.lower() and key:
+            return base, key
+    trace.append("没有 base_url 含 'antigravity' 且带 key 的 provider")
+    return None, None
 
 
 def _collect_gemini_images(node, out):
@@ -492,15 +630,20 @@ def _retry_generate(gen_fn, retries, label):
 
 def run_gemini(args, opener):
     cc_base, cc_key = (None, None)
+    cc_trace = []
     if not args.no_ccswitch:
-        cc_base, cc_key = resolve_antigravity_from_ccswitch()
+        cc_base, cc_key = resolve_antigravity_from_ccswitch(cc_trace)
     key = args.key or cc_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("BESTAI_API_KEY")
     base = args.base_url or cc_base
+    why = ("; ".join(cc_trace) if cc_trace
+           else "cc-switch 已被 --no-ccswitch 关闭" if args.no_ccswitch
+           else "cc-switch 没有 antigravity provider")
     if not base:
-        _die("no antigravity base_url — cc-switch has no provider whose base_url "
-             "contains 'antigravity'; pass --base-url (e.g. https://api.bestai.codes/antigravity)")
+        _die("no antigravity base_url — " + why +
+             " — pass --base-url (e.g. https://api.bestai.codes/antigravity)")
     if not key:
-        _die("no API key for gemini/antigravity — pass --key or set GEMINI_API_KEY / BESTAI_API_KEY")
+        _die("no API key for gemini/antigravity — " + why +
+             " — pass --key or set GEMINI_API_KEY / BESTAI_API_KEY")
     _SECRETS.append(key)
     if not host_allowed(base):
         _die(f"base_url '{base}' is not allowed — must be https and the host "
@@ -566,20 +709,27 @@ def main():
 
     opener = make_opener(args.proxy)
 
-    # Credential resolution: explicit flags > cc-switch current provider > env > default
-    cc_base, cc_key = (None, None)
+    # Credential resolution: explicit flags > cc-switch (current provider of the
+    # requested app, else borrowed from any provider with allowlisted creds)
+    # > env > default
+    cc_base, cc_key, cc_label = (None, None, None)
+    cc_trace = []
     if not args.no_ccswitch:
-        cc_base, cc_key = resolve_from_ccswitch(args.ccswitch_app)
+        cc_base, cc_key, cc_label = resolve_from_ccswitch(args.ccswitch_app, cc_trace)
 
     key = (args.key or cc_key
            or os.environ.get("BESTAI_API_KEY") or os.environ.get("OPENAI_API_KEY"))
     if not key:
-        _die("no API key — cc-switch had none; pass --key or set BESTAI_API_KEY / OPENAI_API_KEY")
+        why = ("; ".join(cc_trace) if cc_trace
+               else "cc-switch 已被 --no-ccswitch 关闭" if args.no_ccswitch
+               else "cc-switch 里没找到可用的 key")
+        _die("no API key — " + why +
+             " — pass --key or set BESTAI_API_KEY / OPENAI_API_KEY")
     _SECRETS.append(key)
 
     base_url = args.base_url or cc_base or DEFAULT_BASE
-    src = "flag" if args.base_url else ("cc-switch" if cc_base else "default")
-    key_src = "flag" if args.key else ("cc-switch" if cc_key else "env")
+    src = "flag" if args.base_url else (cc_label if cc_base else "default")
+    key_src = "flag" if args.key else (cc_label if cc_key else "env")
 
     # Security guard: never send the key to a non-https or non-allowlisted URL.
     if not host_allowed(base_url):

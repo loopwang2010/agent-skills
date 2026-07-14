@@ -37,14 +37,25 @@ product/UI mockup, logo exploration, texture, banner, hero image, etc.
 ## Credentials
 Resolution order (first hit wins):
 1. `--key` / `--base-url` flags.
-2. **cc-switch current provider** (`~/.cc-switch/`, app_type `codex`) — if you use
-   cc-switch with a bestai provider, this is automatic, no setup.
+2. **cc-switch** (`~/.cc-switch/`) — automatic, no setup, robust across layouts:
+   the current provider of the requested app (`--ccswitch-app`, default codex);
+   if that has no usable key (e.g. codex is the official OAuth provider), it
+   **borrows** from any other provider — claude / claude-desktop current first —
+   that has a key AND an allowlisted https base_url (Anthropic-style endpoint
+   roots get `/v1` appended; `antigravity` bases are skipped — those belong to
+   `--provider gemini`). Works with the new SQLite `cc-switch.db` (composite
+   `(id, app_type)` key, `is_current` column), old DBs without `is_current`,
+   and legacy `config.json`-only installs.
 3. `BESTAI_API_KEY` / `OPENAI_API_KEY` environment variable.
 4. Built-in default base_url.
 
 If you do NOT use cc-switch, set your own bestai key once:
 `export BESTAI_API_KEY=sk-...` (or `setx BESTAI_API_KEY "sk-..."` on Windows).
 This skill bundles NO key — everyone uses their own. Never paste a key into chat.
+
+When no key can be found, the error now states WHY cc-switch resolution failed
+(dir missing / no current provider / no provider with allowlisted creds), so a
+misconfigured machine is diagnosable from the error message alone.
 
 ## How to run
 Run the bundled script with your shell/exec/Bash tool (path is relative to this

@@ -428,5 +428,172 @@ class IndexedOutTests(unittest.TestCase):
         self.assertEqual(big._indexed_out("hero", 1, 2), "hero_2.png")
 
 
+class CcSwitchResolveTests(unittest.TestCase):
+    """resolve_from_ccswitch must work across every cc-switch storage
+    generation and provider layout seen in the field (2026-07-14 fix):
+
+      * providers PRIMARY KEY is (id, app_type) — same id repeats across
+        apps, so lookups must filter by app_type;
+      * the current provider may be marked ONLY by the DB is_current column
+        (settings.json may lack currentProviderCodex);
+      * bestai creds are often configured under the *claude* app while the
+        script asks for codex — borrow them (and append /v1 to the
+        Anthropic-style endpoint root);
+      * legacy installs store everything in config.json (no SQLite at all);
+      * every failure must leave a human-readable reason in the trace.
+    """
+
+    KEY = "sk-test-" + "x" * 40
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_dir = big.CCSWITCH_DIR
+        big.CCSWITCH_DIR = os.path.join(self._tmp.name, ".cc-switch")
+        os.makedirs(big.CCSWITCH_DIR)
+
+    def tearDown(self):
+        big.CCSWITCH_DIR = self._old_dir
+        self._tmp.cleanup()
+
+    # -- fixture builders ---------------------------------------------------
+
+    def _write_db(self, rows, with_is_current=True):
+        import sqlite3
+        db = os.path.join(big.CCSWITCH_DIR, "cc-switch.db")
+        con = sqlite3.connect(db)
+        cols = "id TEXT, app_type TEXT, name TEXT, settings_config TEXT"
+        if with_is_current:
+            cols += ", is_current BOOLEAN DEFAULT 0"
+        con.execute(f"CREATE TABLE providers ({cols}, PRIMARY KEY (id, app_type))")
+        for r in rows:
+            if with_is_current:
+                con.execute("INSERT INTO providers VALUES (?,?,?,?,?)",
+                            (r["id"], r["app"], r.get("name", r["id"]),
+                             json.dumps(r["sc"]), int(r.get("is_current", 0))))
+            else:
+                con.execute("INSERT INTO providers VALUES (?,?,?,?)",
+                            (r["id"], r["app"], r.get("name", r["id"]),
+                             json.dumps(r["sc"])))
+        con.commit()
+        con.close()
+
+    def _write_settings(self, d):
+        with open(os.path.join(big.CCSWITCH_DIR, "settings.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(d, f)
+
+    # -- the original happy path must keep working ---------------------------
+
+    def test_settings_pointer_plus_db(self):
+        self._write_db([{
+            "id": "uuid-1", "app": "codex", "name": "bestai",
+            "sc": {"auth": {"OPENAI_API_KEY": self.KEY},
+                   "config": 'base_url = "https://api.bestai.codes/v1"'},
+        }])
+        self._write_settings({"currentProviderCodex": "uuid-1"})
+        base, key, label = big.resolve_from_ccswitch("codex")
+        self.assertEqual(base, "https://api.bestai.codes/v1")
+        self.assertEqual(key, self.KEY)
+        self.assertIn("codex", label)
+
+    # -- 2026-07-14 failure modes --------------------------------------------
+
+    def test_same_id_across_apps_picks_requested_app_row(self):
+        # PRIMARY KEY (id, app_type): id 'default' exists under claude AND
+        # codex. The old WHERE id=? could return the claude row (no codex key).
+        self._write_db([
+            {"id": "default", "app": "claude", "name": "wrong",
+             "sc": {"env": {"SOMETHING_ELSE": "nope"}}},
+            {"id": "default", "app": "codex", "name": "right",
+             "sc": {"auth": {"OPENAI_API_KEY": self.KEY},
+                    "config": 'base_url = "https://api.bestai.codes/v1"'}},
+        ])
+        self._write_settings({"currentProviderCodex": "default"})
+        base, key, _ = big.resolve_from_ccswitch("codex")
+        self.assertEqual(key, self.KEY)
+        self.assertEqual(base, "https://api.bestai.codes/v1")
+
+    def test_is_current_fallback_without_settings_json(self):
+        # No settings.json at all — the DB is_current column must be enough.
+        self._write_db([{
+            "id": "uuid-2", "app": "codex", "name": "bestai", "is_current": 1,
+            "sc": {"auth": {"OPENAI_API_KEY": self.KEY},
+                   "config": 'base_url = "https://api.bestai.codes/v1"'},
+        }])
+        base, key, _ = big.resolve_from_ccswitch("codex")
+        self.assertEqual(key, self.KEY)
+
+    def test_borrows_claude_provider_and_appends_v1(self):
+        # The reported field failure: bestai configured only under the CLAUDE
+        # app (machine runs Claude Code); codex current is official/keyless.
+        self._write_db([
+            {"id": "codex-official", "app": "codex", "name": "OpenAI Official",
+             "is_current": 1, "sc": {"config": 'model = "gpt-5"'}},
+            {"id": "uuid-c", "app": "claude", "name": "claude-bestai",
+             "is_current": 1,
+             "sc": {"env": {"ANTHROPIC_AUTH_TOKEN": self.KEY,
+                            "ANTHROPIC_BASE_URL": "https://api.bestai.codes"}}},
+        ])
+        base, key, label = big.resolve_from_ccswitch("codex")
+        self.assertEqual(key, self.KEY)
+        self.assertEqual(base, "https://api.bestai.codes/v1")  # /v1 appended
+        self.assertIn("claude-bestai", label)
+
+    def test_borrow_skips_antigravity_and_offlist_hosts(self):
+        self._write_db([
+            {"id": "anti", "app": "claude", "name": "anti-bestai",
+             "is_current": 1,
+             "sc": {"env": {"ANTHROPIC_AUTH_TOKEN": self.KEY,
+                            "ANTHROPIC_BASE_URL": "https://api.bestai.codes/antigravity"}}},
+            {"id": "other", "app": "claude", "name": "off-allowlist",
+             "sc": {"env": {"ANTHROPIC_AUTH_TOKEN": self.KEY,
+                            "ANTHROPIC_BASE_URL": "https://evil.example.com"}}},
+        ])
+        trace = []
+        base, key, label = big.resolve_from_ccswitch("codex", trace)
+        self.assertIsNone(key)
+        self.assertTrue(any("provider" in t for t in trace), trace)
+
+    def test_old_db_schema_without_is_current_column(self):
+        self._write_db([{
+            "id": "uuid-3", "app": "codex", "name": "bestai",
+            "sc": {"auth": {"OPENAI_API_KEY": self.KEY},
+                   "config": 'base_url = "https://api.bestai.codes/v1"'},
+        }], with_is_current=False)
+        self._write_settings({"currentProviderCodex": "uuid-3"})
+        base, key, _ = big.resolve_from_ccswitch("codex")
+        self.assertEqual(key, self.KEY)
+
+    def test_legacy_config_json_v2(self):
+        cfg = {"codex": {"current": "p1", "providers": {
+            "p1": {"name": "bestai", "settingsConfig": {
+                "auth": {"OPENAI_API_KEY": self.KEY},
+                "config": 'base_url = "https://api.bestai.codes/v1"'}}}}}
+        with open(os.path.join(big.CCSWITCH_DIR, "config.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(cfg, f)
+        base, key, _ = big.resolve_from_ccswitch("codex")
+        self.assertEqual(key, self.KEY)
+        self.assertEqual(base, "https://api.bestai.codes/v1")
+
+    def test_missing_dir_gives_reason(self):
+        big.CCSWITCH_DIR = os.path.join(self._tmp.name, "nonexistent")
+        trace = []
+        base, key, label = big.resolve_from_ccswitch("codex", trace)
+        self.assertEqual((base, key, label), (None, None, None))
+        self.assertTrue(any(".cc-switch" in t for t in trace), trace)
+
+    def test_antigravity_resolver_prefers_current_and_matches(self):
+        self._write_db([
+            {"id": "g1", "app": "gemini", "name": "antigravity-gemini",
+             "is_current": 1,
+             "sc": {"env": {"ANTHROPIC_AUTH_TOKEN": self.KEY,
+                            "ANTHROPIC_BASE_URL": "https://api.bestai.codes/antigravity"}}},
+        ])
+        base, key = big.resolve_antigravity_from_ccswitch()
+        self.assertEqual(key, self.KEY)
+        self.assertIn("antigravity", base)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
