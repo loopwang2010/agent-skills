@@ -73,7 +73,8 @@ Code it is `$HOME/.claude/skills/bestai-imagegen`. If `python` is missing, try
 `py` or `python3`.
 
 Options: `--prompt/-p` (required), `--image/-i` (input to edit; repeatable),
-`--out/-o`, `--model/-m` (default `gpt-5.5`), `--size/-s`, `--quality/-q`
+`--out/-o`, `--n/--count` (1-16), `--force` (required to overwrite an existing
+`--out`), `--model/-m` (default `gpt-5.5`), `--size/-s`, `--quality/-q`
 (low|medium|high|auto), `--ccswitch-app`, `--no-ccswitch`, `--proxy`,
 `--retries`, `-v`.
 
@@ -102,7 +103,8 @@ base: `--provider gemini --base-url https://<host> --key sk-<gemini-key> --model
 
 STATUS: ✅ verified working (generation + editing) via the Antigravity
 `/v1/messages` path (x-api-key auth). Requires the provider to have a working
-Antigravity account. `--size` is not applied on this path.
+Antigravity account. `--size` (1K/2K/4K) is sent best-effort — the upstream may
+return the model default resolution.
 
 ## Examples: count / size / model
 
@@ -143,7 +145,11 @@ unchanged"). Augment only when the user's prompt is generic.
   UA) and connects direct, ignoring stale `HTTP_PROXY` env. Use `--proxy` if you
   actually need one.
 - `input` is sent as a message list (a bare string yields upstream 400).
-- **Domain allowlist (safety)**: the script only sends credentials to `cccode.ai`,
-  `favcodes.win`, `bestai.codes`, `unitoks.com` and their subdomains; a base_url on
-  any other host is rejected before the request. Edit `ALLOWED_DOMAINS` at the top
-  of the script to change this.
+- **Domain allowlist (safety)**: credentials are only sent over **https** to
+  `cccode.ai`, `favcodes.win`, `bestai.codes`, `unitoks.com` and their subdomains;
+  any other base_url (or an `http://` one) is rejected before the request, and all
+  HTTP redirects are refused so the key can never be forwarded elsewhere. Edit
+  `ALLOWED_DOMAINS` at the top of the script to change this.
+- **Guards**: an existing `--out` is never overwritten without `--force`;
+  `--image` inputs must actually be png/jpg/webp by content (≤ 20 MB); `--n` is
+  capped at 16. Pass `--out` paths inside the workspace (e.g. `output/...`).

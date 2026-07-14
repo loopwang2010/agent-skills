@@ -51,9 +51,29 @@ DEFAULT_MODEL = "gpt-5.5"  # universally available; gpt-5.6-luna 404s on some ac
 # Edit this tuple to change what is permitted.
 ALLOWED_DOMAINS = ("cccode.ai", "favcodes.win", "bestai.codes", "unitoks.com")
 
+MAX_IMAGE_BYTES = 20 * 1024 * 1024  # refuse larger --image inputs
+MAX_BATCH = 16                      # --n upper bound (guards against runaway loops)
+
+# Secrets registered here are scrubbed from every error/status line we print
+# (defense-in-depth: a malicious upstream echoing request headers in an error
+# body must not get the key persisted into terminal logs / agent transcripts).
+_SECRETS = []
+
+
+def _redact(text):
+    for s in _SECRETS:
+        if s:
+            text = text.replace(s, "***")
+    return text
+
 
 def host_allowed(base_url):
-    host = (urlparse(base_url).hostname or "").lower().rstrip(".")
+    # https only: an http:// base would send the key in cleartext (and let any
+    # on-path observer answer with a redirect). Checked before every request.
+    parsed = urlparse(base_url)
+    if parsed.scheme != "https":
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
     return bool(host) and any(
         host == d or host.endswith("." + d) for d in ALLOWED_DOMAINS
     )
@@ -113,7 +133,7 @@ def resolve_from_ccswitch(app_type="codex"):
 
 
 def _die(msg, code=1):
-    print("error: " + msg, file=sys.stderr)
+    print("error: " + _redact(msg), file=sys.stderr)
     sys.exit(code)
 
 
@@ -130,13 +150,39 @@ def _collect_b64(node, keys, out):
             _collect_b64(v, keys, out)
 
 
-def _image_data_url(path):
-    ext = os.path.splitext(path)[1].lower()
-    mime = {".png": "image/png", ".webp": "image/webp",
-            ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext, "image/png")
+def _sniff_image(raw):
+    """Magic-byte detection — the content decides the MIME, never the extension."""
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if raw[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _read_image_bytes(path):
+    """Read + validate an --image input: must actually BE a png/jpeg/webp (by
+    magic bytes) and under MAX_IMAGE_BYTES. Guards the agent-driven invocation
+    path against being tricked into uploading a non-image (key file, config,
+    database) as 'image' data. Returns (raw_bytes, mime)."""
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        _die(f"cannot read input image {path}: {e}")
+    if size > MAX_IMAGE_BYTES:
+        _die(f"input image too large: {path} ({size} bytes; limit {MAX_IMAGE_BYTES})")
     with open(path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode()
-    return f"data:{mime};base64,{b64}"
+        raw = f.read()
+    mime = _sniff_image(raw)
+    if not mime:
+        _die(f"not a supported image (png/jpg/webp by content, not extension): {path}")
+    return raw, mime
+
+
+def _image_data_url(path):
+    raw, mime = _read_image_bytes(path)
+    return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
 
 
 def build_payload(prompt, model, size, quality, image_paths=None):
@@ -161,6 +207,22 @@ def build_payload(prompt, model, size, quality, image_paths=None):
     }
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse ALL redirects. urllib's default handler forwards Authorization /
+    x-api-key headers to the Location target, so a single 302 from a
+    compromised (or spoofed) allowlisted host would exfiltrate the key past
+    the ALLOWED_DOMAINS check — which only ever sees the initial URL.
+    Authenticated API POSTs never legitimately redirect (urllib would
+    downgrade them to body-less GETs anyway), so hard-fail instead."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urlparse(newurl).hostname or "?"
+        raise urllib.error.HTTPError(
+            req.full_url, code,
+            f"redirect to '{target}' blocked — refusing to forward credentials",
+            headers, fp)
+
+
 def make_opener(proxy):
     # Default: ignore ambient HTTP(S)_PROXY env (it may point at a dead proxy)
     # and connect directly. Pass --proxy to route through one explicitly.
@@ -168,7 +230,7 @@ def make_opener(proxy):
         handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
     else:
         handler = urllib.request.ProxyHandler({})
-    return urllib.request.build_opener(handler)
+    return urllib.request.build_opener(handler, _NoRedirectHandler())
 
 
 def stream_once(opener, base, key, payload, verbose):
@@ -204,6 +266,8 @@ def stream_once(opener, base, key, payload, verbose):
                 evt = json.loads(data)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(evt, dict):  # valid JSON but not an event object
+                continue
             _collect_b64(evt, {"result", "partial_image_b64", "b64_json"}, images)
             etype = evt.get("type", "")
             if "output_text" in etype:
@@ -215,15 +279,31 @@ def stream_once(opener, base, key, payload, verbose):
     return images, "".join(text_parts), err
 
 
+def _check_out(out_path, force):
+    """Refuse to overwrite an existing file (or write through a symlink)
+    unless --force. Called for every output path BEFORE any request is sent,
+    so a refusal never wastes a paid generation."""
+    if force:
+        return
+    if os.path.islink(out_path) or os.path.exists(out_path):
+        _die(f"output already exists: {out_path} — pass --force to overwrite")
+
+
 def save_png(b64, out_path):
-    raw = base64.b64decode(b64 + "=" * (-len(b64) % 4))
-    dirname = os.path.dirname(os.path.abspath(out_path))
-    if dirname:
-        os.makedirs(dirname, exist_ok=True)
-    with open(out_path, "wb") as f:
-        f.write(raw)
+    try:
+        raw = base64.b64decode(b64 + "=" * (-len(b64) % 4))
+    except ValueError:  # binascii.Error is a ValueError subclass
+        _die("corrupt image data from upstream (invalid base64)")
+    try:
+        dirname = os.path.dirname(os.path.abspath(out_path))
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+        with open(out_path, "wb") as f:
+            f.write(raw)
+    except OSError as e:
+        _die(f"cannot write {out_path}: {e}")
     dims = ""
-    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+    if len(raw) >= 24 and raw[:8] == b"\x89PNG\r\n\x1a\n":
         w, h = struct.unpack(">II", raw[16:24])
         dims = f" ({w}x{h})"
     return len(raw), dims
@@ -308,12 +388,6 @@ def _collect_gemini_images(node, out):
             _collect_gemini_images(v, out)
 
 
-def _mime_of(path):
-    ext = os.path.splitext(path)[1].lower()
-    return {".png": "image/png", ".webp": "image/webp",
-            ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext, "image/png")
-
-
 def _collect_anthropic_images(node, out):
     """Walk an Anthropic Messages response for base64 image data (source.data),
     also handling Gemini inlineData passthrough."""
@@ -339,10 +413,10 @@ def gemini_generate(opener, base, key, model, prompt, size, image_paths):
     url = base.rstrip("/") + "/v1/messages"
     content = [{"type": "text", "text": prompt}]
     for p in image_paths or []:
-        with open(p, "rb") as f:
-            content.append({"type": "image", "source": {
-                "type": "base64", "media_type": _mime_of(p),
-                "data": base64.b64encode(f.read()).decode()}})
+        raw, mime = _read_image_bytes(p)
+        content.append({"type": "image", "source": {
+            "type": "base64", "media_type": mime,
+            "data": base64.b64encode(raw).decode()}})
     body = {"model": model, "max_tokens": 8192,
             "messages": [{"role": "user", "content": content}]}
     sz = (size or "").upper()
@@ -354,10 +428,17 @@ def gemini_generate(opener, base, key, model, prompt, size, image_paths):
         headers={"x-api-key": key, "anthropic-version": "2023-06-01",
                  "Content-Type": "application/json", "User-Agent": "curl/8.4.0"})
     with opener.open(req, timeout=300) as resp:
-        data = json.loads(resp.read())
+        body_bytes = resp.read()
+    try:
+        data = json.loads(body_bytes)
+    except ValueError:
+        # e.g. a Cloudflare challenge page served with HTTP 200 — surface as a
+        # retryable upstream error instead of an uncaught JSONDecodeError.
+        snippet = body_bytes.decode("utf-8", "replace")[:200]
+        return [], {"message": "upstream returned non-JSON response: " + snippet}
     images = []
     _collect_anthropic_images(data, images)
-    return images, data.get("error")
+    return images, data.get("error") if isinstance(data, dict) else None
 
 
 def _indexed_out(out, i, n):
@@ -380,7 +461,7 @@ def _retry_generate(gen_fn, retries, label):
                 msg = str(err.get("message") or err.get("code") or err.get("status") or err)
                 last_err = msg
                 if _retryable(msg):
-                    print(f"  retryable: {msg}", file=sys.stderr)
+                    print(f"  retryable: {_redact(msg)}", file=sys.stderr)
                     time.sleep(1.5)
                     continue
                 _die("upstream error: " + msg)
@@ -391,16 +472,18 @@ def _retry_generate(gen_fn, retries, label):
                 continue
             return max(images, key=len)
         except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", "replace")[:300]
+            detail = e.read().decode("utf-8", "replace")[:300] or str(e.reason)
             last_err = f"HTTP {e.code}: {detail}"
+            if 300 <= e.code < 400:  # blocked redirect (see _NoRedirectHandler)
+                _die(last_err)
             if _retryable(detail) or e.code >= 500 or e.code == 404:
-                print(f"  {last_err} — retrying ...", file=sys.stderr)
+                print(f"  {_redact(last_err)} — retrying ...", file=sys.stderr)
                 time.sleep(1.5)
                 continue
             _die(last_err)
         except urllib.error.URLError as e:
             last_err = "network error: " + str(e.reason)
-            print(f"  {last_err} — retrying ...", file=sys.stderr)
+            print(f"  {_redact(last_err)} — retrying ...", file=sys.stderr)
             time.sleep(2.0)
             continue
     _die("exhausted retries. last: " + str(last_err) +
@@ -418,21 +501,24 @@ def run_gemini(args, opener):
              "contains 'antigravity'; pass --base-url (e.g. https://api.bestai.codes/antigravity)")
     if not key:
         _die("no API key for gemini/antigravity — pass --key or set GEMINI_API_KEY / BESTAI_API_KEY")
+    _SECRETS.append(key)
     if not host_allowed(base):
-        host = urlparse(base).hostname or "(none)"
-        _die(f"base_url host '{host}' is not in the allowed domains "
-             f"{', '.join(ALLOWED_DOMAINS)}. Refusing to send credentials to an untrusted host.")
+        _die(f"base_url '{base}' is not allowed — must be https and the host "
+             f"must be under: {', '.join(ALLOWED_DOMAINS)}. "
+             "Refusing to send credentials to an untrusted destination.")
     model = args.model if args.model != DEFAULT_MODEL else GEMINI_DEFAULT_MODEL
     src = "flag" if args.base_url else ("cc-switch" if cc_base else "default")
     mode = "editing" if args.image else "generating"
     note = f" from {len(args.image)} image(s)" if args.image else ""
-    n = max(1, args.n)
-    for i in range(n):
+    n = args.n
+    outs = [_indexed_out(args.out, i, n) for i in range(n)]
+    for o in outs:  # fail before spending any generation on a refused path
+        _check_out(o, args.force)
+    for i, out_i in enumerate(outs):
         label = f"gemini/antigravity {mode}{note} #{i + 1}/{n}: {model} @ {base} (base:{src})"
         b64 = _retry_generate(
             lambda: gemini_generate(opener, base, key, model, args.prompt, args.size, args.image),
             args.retries, label)
-        out_i = _indexed_out(args.out, i, n)
         nb, dims = save_png(b64, out_i)
         print(f"OK  saved {out_i}{dims}  ({nb} bytes)")
 
@@ -445,8 +531,8 @@ def main():
                     help="input image to EDIT/reference (png/jpg/webp); repeat for multiple")
     ap.add_argument("--provider", default="openai", choices=["openai", "gemini"],
                     help="openai = Responses image_generation (default); "
-                         "gemini = Gemini generateContent (Antigravity by default, "
-                         "or native via --base-url/--key)")
+                         "gemini = Gemini image models via the Antigravity "
+                         "/v1/messages path (or native via --base-url/--key)")
     ap.add_argument("--out", "-o", default="bestai_image.png", help="output PNG path")
     ap.add_argument("--model", "-m", default=DEFAULT_MODEL,
                     help=f"openai: text model driving the tool (default {DEFAULT_MODEL}); "
@@ -456,7 +542,10 @@ def main():
                     help="openai: pixel dims e.g. 1024x1024 / 1536x1024 / 2048x2048 / auto; "
                          "gemini: 1K / 2K / 4K (best-effort — upstream may return model default)")
     ap.add_argument("--n", "--count", type=int, default=1,
-                    help="number of images to generate (>1 saves out_1.png, out_2.png, ...)")
+                    help=f"number of images to generate, 1-{MAX_BATCH} "
+                         "(>1 saves out_1.png, out_2.png, ...)")
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite --out if it already exists (refused otherwise)")
     ap.add_argument("--quality", "-q", default=None, choices=[None, "low", "medium", "high", "auto"],
                     help="openai only: low|medium|high|auto")
     ap.add_argument("--base-url", default=None, help="override base_url (default: from cc-switch, else built-in)")
@@ -469,6 +558,12 @@ def main():
     ap.add_argument("--verbose", "-v", action="store_true", help="print SSE event types")
     args = ap.parse_args()
 
+    # Validate bounds before touching credentials or the network.
+    if not 1 <= args.n <= MAX_BATCH:
+        _die(f"--n must be between 1 and {MAX_BATCH} (got {args.n})")
+    if args.retries < 1:
+        _die(f"--retries must be >= 1 (got {args.retries})")
+
     opener = make_opener(args.proxy)
 
     # Credential resolution: explicit flags > cc-switch current provider > env > default
@@ -480,17 +575,17 @@ def main():
            or os.environ.get("BESTAI_API_KEY") or os.environ.get("OPENAI_API_KEY"))
     if not key:
         _die("no API key — cc-switch had none; pass --key or set BESTAI_API_KEY / OPENAI_API_KEY")
+    _SECRETS.append(key)
 
     base_url = args.base_url or cc_base or DEFAULT_BASE
     src = "flag" if args.base_url else ("cc-switch" if cc_base else "default")
     key_src = "flag" if args.key else ("cc-switch" if cc_key else "env")
 
-    # Security guard: never send the key to a host outside the allowlist.
+    # Security guard: never send the key to a non-https or non-allowlisted URL.
     if not host_allowed(base_url):
-        host = urlparse(base_url).hostname or "(none)"
-        _die(f"base_url host '{host}' is not in the allowed domains "
-             f"{', '.join(ALLOWED_DOMAINS)} (base source: {src}). "
-             "Refusing to send credentials to an untrusted host.")
+        _die(f"base_url '{base_url}' is not allowed (source: {src}) — must be "
+             f"https and the host must be under: {', '.join(ALLOWED_DOMAINS)}. "
+             "Refusing to send credentials to an untrusted destination.")
 
     for p in args.image or []:
         if not os.path.isfile(p):
@@ -503,14 +598,16 @@ def main():
     mode = "editing" if args.image else "generating"
     note = f" from {len(args.image)} image(s)" if args.image else ""
     payload = build_payload(args.prompt, args.model, args.size, args.quality, args.image)
-    n = max(1, args.n)
-    for i in range(n):
+    n = args.n
+    outs = [_indexed_out(args.out, i, n) for i in range(n)]
+    for o in outs:  # fail before spending any generation on a refused path
+        _check_out(o, args.force)
+    for i, out_i in enumerate(outs):
         label = f"{mode}{note} #{i + 1}/{n}: {args.model} @ {base_url} (base:{src}, key:{key_src})"
         # stream_once returns (images, text, err); [::2] -> (images, err)
         b64 = _retry_generate(
             lambda: stream_once(opener, base_url, key, payload, args.verbose)[::2],
             args.retries, label)
-        out_i = _indexed_out(args.out, i, n)
         nb, dims = save_png(b64, out_i)
         print(f"OK  saved {out_i}{dims}  ({nb} bytes)")
 

@@ -48,10 +48,11 @@ setx BESTAI_API_KEY "sk-..."        # Windows
 ```
 
 Never paste an API key into a chat or commit one to a repo. As a safety net the
-script refuses to send credentials to any host outside its `ALLOWED_DOMAINS`
-allowlist (edit the tuple at the top of
+script only sends credentials over **https** to hosts in its `ALLOWED_DOMAINS`
+allowlist, and **refuses all HTTP redirects** (so a 302 can't forward the key
+elsewhere). Edit the tuple at the top of
 `skills/bestai-imagegen/scripts/bestai_imagegen.py` to match your own gateway
-host(s) — the key can never leak to a host you didn't list).
+host(s).
 
 ## Providers & options
 
@@ -81,7 +82,8 @@ python skills/bestai-imagegen/scripts/bestai_imagegen.py \
 | `--size / -s` | openai: pixel dims (`1024x1024` / `1536x1024` / `2048x2048` / `auto`); gemini: `1K` / `2K` / `4K` (best-effort) |
 | `--model / -m` | openai text model (default `gpt-5.5`); gemini image model (default `gemini-3-pro-image`) |
 | `--quality / -q` | openai only: `low` / `medium` / `high` / `auto` |
-| `--image / -i` | source image to edit; repeat for compositing/references |
+| `--image / -i` | source image to edit (real png/jpg/webp, ≤ 20 MB); repeat for compositing/references |
+| `--force` | required to overwrite an existing `--out` file (refused otherwise) |
 
 See the skill's own [`SKILL.md`](skills/bestai-imagegen/SKILL.md) for full usage
 and notes. Licensed under [MIT](LICENSE).
