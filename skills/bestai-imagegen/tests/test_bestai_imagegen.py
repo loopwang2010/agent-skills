@@ -594,6 +594,84 @@ class CcSwitchResolveTests(unittest.TestCase):
         self.assertEqual(key, self.KEY)
         self.assertIn("antigravity", base)
 
+    # -- 2026-07-14 adversarial-review fixes (3 HIGH findings) ---------------
+
+    def test_non_dict_auth_env_never_raises(self):
+        # HIGH-1: hand-edited/mangled settings_config with a truthy non-dict
+        # under auth/env crashed both resolvers (AttributeError / TypeError).
+        self._write_db([
+            {"id": "bad", "app": "codex", "name": "mangled", "is_current": 1,
+             "sc": {"auth": "not-a-dict", "env": [1, 2, 3]}},
+            {"id": "good", "app": "claude", "name": "claude-bestai",
+             "is_current": 1,
+             "sc": {"env": {"ANTHROPIC_AUTH_TOKEN": self.KEY,
+                            "ANTHROPIC_BASE_URL": "https://api.bestai.codes"}}},
+        ])
+        base, key, _ = big.resolve_from_ccswitch("codex")  # must not raise
+        self.assertEqual(key, self.KEY)  # skips mangled row, borrows claude
+        big.resolve_antigravity_from_ccswitch()  # must not raise either
+
+    def test_primary_with_offlist_base_falls_through_to_borrow(self):
+        # HIGH-2: codex current = a REAL but non-bestai provider (personal
+        # OpenAI key + api.openai.com). Old code returned it immediately
+        # (main() then died on host_allowed) and never tried the working
+        # claude bestai creds sitting right there.
+        self._write_db([
+            {"id": "openai", "app": "codex", "name": "OpenAI personal",
+             "is_current": 1,
+             "sc": {"env": {"OPENAI_API_KEY": "sk-personal-openai",
+                            "OPENAI_BASE_URL": "https://api.openai.com/v1"}}},
+            {"id": "cb", "app": "claude", "name": "claude-bestai",
+             "is_current": 1,
+             "sc": {"env": {"ANTHROPIC_AUTH_TOKEN": self.KEY,
+                            "ANTHROPIC_BASE_URL": "https://api.bestai.codes"}}},
+        ])
+        trace = []
+        base, key, label = big.resolve_from_ccswitch("codex", trace)
+        self.assertEqual(key, self.KEY)
+        self.assertEqual(base, "https://api.bestai.codes/v1")
+        self.assertIn("claude-bestai", label)
+        self.assertTrue(any("被跳过" in t for t in trace), trace)
+
+    def test_bare_key_is_never_paired_with_default_base(self):
+        # HIGH-3: a current provider holding only an (unrelated) key and no
+        # base must NOT resolve — pairing it with the built-in default base
+        # would forward a foreign secret to the default gateway.
+        self._write_db([{
+            "id": "official", "app": "codex", "name": "official",
+            "is_current": 1,
+            "sc": {"env": {"OPENAI_API_KEY": "sk-REAL-PERSONAL-KEY"}},
+        }])
+        trace = []
+        base, key, label = big.resolve_from_ccswitch("codex", trace)
+        self.assertEqual((base, key, label), (None, None, None))
+        self.assertTrue(any("没有 base_url" in t for t in trace), trace)
+
+    # -- remaining legacy layouts -------------------------------------------
+
+    def test_legacy_config_json_v1_flat(self):
+        cfg = {"current": "p1", "providers": {
+            "p1": {"name": "bestai", "settingsConfig": {
+                "env": {"ANTHROPIC_AUTH_TOKEN": self.KEY,
+                        "ANTHROPIC_BASE_URL": "https://api.bestai.codes"}}}}}
+        with open(os.path.join(big.CCSWITCH_DIR, "config.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(cfg, f)
+        base, key, _ = big.resolve_from_ccswitch("codex")  # borrowed from claude
+        self.assertEqual(key, self.KEY)
+        self.assertEqual(base, "https://api.bestai.codes/v1")
+
+    def test_legacy_config_json_apps_wrapper(self):
+        cfg = {"apps": {"codex": {"current": "p1", "providers": {
+            "p1": {"name": "bestai", "settingsConfig": {
+                "auth": {"OPENAI_API_KEY": self.KEY},
+                "config": 'base_url = "https://api.bestai.codes/v1"'}}}}}}
+        with open(os.path.join(big.CCSWITCH_DIR, "config.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(cfg, f)
+        base, key, _ = big.resolve_from_ccswitch("codex")
+        self.assertEqual(key, self.KEY)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

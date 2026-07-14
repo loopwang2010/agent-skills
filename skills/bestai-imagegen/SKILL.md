@@ -37,15 +37,17 @@ product/UI mockup, logo exploration, texture, banner, hero image, etc.
 ## Credentials
 Resolution order (first hit wins):
 1. `--key` / `--base-url` flags.
-2. **cc-switch** (`~/.cc-switch/`) — automatic, no setup, robust across layouts:
-   the current provider of the requested app (`--ccswitch-app`, default codex);
-   if that has no usable key (e.g. codex is the official OAuth provider), it
-   **borrows** from any other provider — claude / claude-desktop current first —
-   that has a key AND an allowlisted https base_url (Anthropic-style endpoint
-   roots get `/v1` appended; `antigravity` bases are skipped — those belong to
-   `--provider gemini`). Works with the new SQLite `cc-switch.db` (composite
+2. **cc-switch** (`~/.cc-switch/`) — automatic, no setup, robust across layouts.
+   Providers are tried in order — requested app's current (`--ccswitch-app`,
+   default codex), then the other apps' current, then all — and the FIRST one
+   holding a complete safe pair wins: a key AND an allowlisted https base_url
+   (Anthropic-style endpoint roots get `/v1` appended; `antigravity` bases are
+   skipped — those belong to `--provider gemini`). cc-switch creds always
+   travel as a pair: a bare key is never combined with the built-in default
+   base, so an unrelated provider's secret can't be forwarded to the default
+   gateway. Works with the new SQLite `cc-switch.db` (composite
    `(id, app_type)` key, `is_current` column), old DBs without `is_current`,
-   and legacy `config.json`-only installs.
+   and legacy `config.json`-only installs (v1 flat / v2 / `apps` wrapper).
 3. `BESTAI_API_KEY` / `OPENAI_API_KEY` environment variable.
 4. Built-in default base_url.
 

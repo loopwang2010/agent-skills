@@ -197,32 +197,41 @@ def _ccswitch_current_of(rows, app):
     return None
 
 
+def _as_dict(v):
+    """Hand-edited / partially-migrated cc-switch data can hold a non-dict
+    where a dict is expected; the resolvers promise to never raise."""
+    return v if isinstance(v, dict) else {}
+
+
+def _str_field(d, keys):
+    """First non-empty STRING value under any of `keys` (non-str values in a
+    mangled config must not crash header building later)."""
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, str) and v:
+            return v
+    return None
+
+
 def _openai_base_key_from_sc(sc):
     """(base, key, base_is_anthropic) for the /v1/responses path.
     base_is_anthropic marks a base taken from ANTHROPIC_BASE_URL — those are
     endpoint roots (https://api.bestai.codes) and need /v1 appended."""
-    auth = sc.get("auth") or {}
-    env = sc.get("env") or {}
-    key = None
-    for k in ("OPENAI_API_KEY", "API_KEY", "key", "ANTHROPIC_AUTH_TOKEN"):
-        if auth.get(k):
-            key = auth[k]
-            break
-    if not key:
-        for k in ("OPENAI_API_KEY", "API_KEY", "ANTHROPIC_AUTH_TOKEN"):
-            if env.get(k):
-                key = env[k]
-                break
-    base = env.get("OPENAI_BASE_URL")
+    auth = _as_dict(sc.get("auth"))
+    env = _as_dict(sc.get("env"))
+    key = (_str_field(auth, ("OPENAI_API_KEY", "API_KEY", "key", "ANTHROPIC_AUTH_TOKEN"))
+           or _str_field(env, ("OPENAI_API_KEY", "API_KEY", "ANTHROPIC_AUTH_TOKEN")))
+    base = _str_field(env, ("OPENAI_BASE_URL",))
     base_is_anthropic = False
-    if not base and env.get("ANTHROPIC_BASE_URL"):
-        base = env["ANTHROPIC_BASE_URL"]
-        base_is_anthropic = True
+    if not base:
+        base = _str_field(env, ("ANTHROPIC_BASE_URL",))
+        base_is_anthropic = base is not None
     cfg = sc.get("config")
     if not base and isinstance(cfg, str):
         m = re.search(r'base_url\s*=\s*"([^"]+)"', cfg)
         if m:
             base = m.group(1)
+            base_is_anthropic = False
     return base, key, base_is_anthropic
 
 
@@ -234,16 +243,20 @@ def _ensure_v1_path(base):
 def resolve_from_ccswitch(app_type="codex", trace=None):
     """Resolve (base_url, key, label) for the OpenAI path from cc-switch.
 
-    1. Current provider of the requested app (lenient, original semantics:
-       a key alone is fine — base falls back to the default later).
-    2. Otherwise BORROW from other providers — current providers of the other
-       apps first, then everything — but strictly: the candidate must have a
-       key AND an https base on an allowlisted host (borrowed credentials
-       never leave the allowlist), and antigravity bases are skipped (that is
-       a different protocol path; use --provider gemini for it).
+    Candidates are tried in order: current provider of the requested app,
+    current providers of the other apps, then every remaining provider. The
+    FIRST candidate with a complete, safe pair wins: a key AND an https base
+    on an allowlisted host (Anthropic-style endpoint roots get /v1 appended;
+    'antigravity' bases belong to --provider gemini and are skipped).
+
+    cc-switch credentials always travel as a base+key PAIR — a bare key is
+    never combined with the built-in default base, so an unrelated
+    provider's secret (e.g. a personal OpenAI key on an official entry)
+    can never be forwarded to the default gateway. The default-base
+    fallback is reserved for keys the user set explicitly (env / --key).
 
     Returns (None, None, None) when nothing usable; `trace` (optional list)
-    collects the reasons so the final error can say why.
+    collects the reasons so the final error can say why. Never raises.
     """
     trace = trace if trace is not None else []
     rows = _ccswitch_rows(trace)
@@ -251,35 +264,33 @@ def resolve_from_ccswitch(app_type="codex", trace=None):
         return None, None, None
 
     prim = _ccswitch_current_of(rows, app_type)
-    if prim is not None:
-        base, key, is_anth = _openai_base_key_from_sc(prim["sc"])
-        if is_anth:
-            base = _ensure_v1_path(base)
-        if key or base:
-            return base, key, f"cc-switch:{app_type}/{prim['name']}"
-        trace.append(f"当前 {app_type} provider '{prim['name']}' 里没有 key/base_url")
-    else:
+    if prim is None:
         trace.append(f"没有当前 {app_type} provider(settings.json 指针和 is_current 都没有)")
-
-    seen = {id(prim)} if prim is not None else set()
-    ordered = []
+    ordered, seen = [], set()
+    if prim is not None:
+        ordered.append(prim)
+        seen.add(id(prim))
     for app in ("codex", "claude", "claude-desktop"):
         r = _ccswitch_current_of(rows, app)
         if r is not None and id(r) not in seen:
             ordered.append(r)
             seen.add(id(r))
     ordered += [r for r in rows if id(r) not in seen]
+
     for r in ordered:
         base, key, is_anth = _openai_base_key_from_sc(r["sc"])
-        if not (base and key):
-            continue
-        if "antigravity" in base.lower():
-            continue  # anthropic-protocol path; wrong for /v1/responses
         if is_anth:
             base = _ensure_v1_path(base)
-        if not host_allowed(base):
-            continue  # never borrow creds bound for a non-allowlisted host
-        return base, key, f"cc-switch:{r['app']}/{r['name']}"
+        if base and key and "antigravity" not in base.lower() and host_allowed(base):
+            return base, key, f"cc-switch:{r['app']}/{r['name']}"
+        if r is prim:
+            # say WHY the requested app's own provider was passed over
+            why = ("没有 key" if not key else
+                   "没有 base_url(官方/默认端点 provider?)" if not base else
+                   "base 是 antigravity 路径(属于 --provider gemini)"
+                   if "antigravity" in base.lower() else
+                   f"base '{base}' 不是白名单内的 https 地址")
+            trace.append(f"当前 {app_type} provider '{prim['name']}' 被跳过: {why}")
     trace.append("没有任何 provider 同时有 key + 白名单内的 https base_url")
     return None, None, None
 
@@ -479,13 +490,13 @@ _ANTIGRAVITY_KEY_FIELDS = ("GEMINI_API_KEY", "ANTHROPIC_AUTH_TOKEN",
 
 
 def _extract_base_key(sc):
-    merged = {**(sc.get("auth") or {}), **(sc.get("env") or {})}
-    base = next((merged[f] for f in _ANTIGRAVITY_BASE_FIELDS if merged.get(f)), "")
+    merged = {**_as_dict(sc.get("auth")), **_as_dict(sc.get("env"))}
+    base = _str_field(merged, _ANTIGRAVITY_BASE_FIELDS) or ""
     if not base and isinstance(sc.get("config"), str):
         m = re.search(r'base_url\s*=\s*"([^"]+)"', sc["config"])
         if m:
             base = m.group(1)
-    key = next((merged[f] for f in _ANTIGRAVITY_KEY_FIELDS if merged.get(f)), None)
+    key = _str_field(merged, _ANTIGRAVITY_KEY_FIELDS)
     return base, key
 
 
