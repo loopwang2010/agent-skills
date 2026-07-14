@@ -86,4 +86,6 @@ python skills/bestai-imagegen/scripts/bestai_imagegen.py \
 | `--force` | required to overwrite an existing `--out` file (refused otherwise) |
 
 See the skill's own [`SKILL.md`](skills/bestai-imagegen/SKILL.md) for full usage
-and notes. Licensed under [MIT](LICENSE).
+and notes, and [`SECURITY.md`](SECURITY.md) for the credential/file security
+boundary (allowlist, redirect guard, `--image`/`--out` hardening). Licensed under
+[MIT](LICENSE).
